@@ -1,0 +1,14 @@
+build/
+dist/
+data/
+*.log
+.DS_Store
+# game data and the CD's files never go in the repository
+UnrealTournament/
+iso-extract/
+*.iso
+*.u
+*.unr
+*.utx
+*.uax
+*.umx

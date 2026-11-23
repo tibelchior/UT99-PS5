@@ -1,7 +1,7 @@
 # Licences
 
-The port's own code and scripts are free for anyone to use, change and share. The author does not claim ownership of
-this work and does not attach a licence that restricts it. Nobody is asked for credit or permission.
+The port's own code and scripts are free for anyone to use, change and share. The author claim ownership of
+this work, but does not attach a license that restricts it.
 
 That only covers what the author wrote. Everything below belongs to its owners and stays under their terms.
 
@@ -26,6 +26,5 @@ That only covers what the author wrote. Everything below belongs to its owners a
 
 ## The release zip
 
-The release zip holds a built `eboot.bin` so that players do not have to build anything. It contains the compiled
-Unreal Engine 1 code (Epic's) and links the GPL-3.0 platform layer, whose source is the PS5_PayloadSDK project linked
+The release zip holds a built `eboot.bin` so that players do not have to build anything. It contains the compiled code and links the GPL-3.0 platform layer, whose source is the PS5_PayloadSDK project linked
 above. The zip contains no game data. If Epic or another rights holder objects to it, the release is withdrawn.

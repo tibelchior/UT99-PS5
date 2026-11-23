@@ -1,0 +1,1013 @@
+diff --git a/third_party/ut99dc/Source/Audio/Src/AudioCoreLinux.cpp b/third_party/ut99dc/Source/Audio/Src/AudioCoreLinux.cpp
+index 3ecf965..612bacc 100644
+--- a/third_party/ut99dc/Source/Audio/Src/AudioCoreLinux.cpp
++++ b/third_party/ut99dc/Source/Audio/Src/AudioCoreLinux.cpp
+@@ -17,10 +17,13 @@ Revision history:
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include <pthread.h>
++#if defined(__ANDROID__) || defined(__FreeBSD__)
++#define UT99_SDL_AUDIO 1   // SDL queued audio instead of OSS /dev/dsp (Android, PS5)
++#endif
+ #include <sys/time.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+-#if defined(__ANDROID__)
++#if defined(UT99_SDL_AUDIO)
+ #include <sys/select.h>
+ #include "SDL.h"
+ #else
+@@ -48,7 +51,7 @@ void* GetAudioBuffer()
+ 	return AudioBuffer;
+ }
+ 
+-#if defined(__ANDROID__)
++#if defined(UT99_SDL_AUDIO)
+ 
+ static SDL_AudioDeviceID AndroidAudioDevice = 0;
+ 
+@@ -111,7 +114,13 @@ INT OpenAudio( DWORD Rate, INT OutputMode, INT Latency )
+ 	Want.callback = NULL;
+ 	Want.userdata = NULL;
+ 
++	#ifdef UT99_PS5_PAD
++	// PS5 port: the mixer only converts sounds by whole ratios of 11025/22050/44100 Hz, so keep its rate at what it
++	// asked for (44100) and let SDL resample to the console's 48 kHz.
++	AndroidAudioDevice = SDL_OpenAudioDevice( NULL, 0, &Want, &Have, 0 );
++#else
+ 	AndroidAudioDevice = SDL_OpenAudioDevice( NULL, 0, &Want, &Have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE );
++#endif
+ 	if( !AndroidAudioDevice )
+ 	{
+ 		debugf( NAME_Init, TEXT("Android SDL audio: SDL_OpenAudioDevice failed: %s"), appFromAnsi(SDL_GetError()) );
+@@ -462,11 +471,7 @@ UBOOL CreateAudioMutex(AudioMutex* Mutex)
+ 
+ 	pthread_mutexattr_t MutexAttr;
+ 	pthread_mutexattr_init(&MutexAttr);
+-	#if defined(__ANDROID__)
+-	pthread_mutexattr_settype(&MutexAttr, PTHREAD_MUTEX_RECURSIVE);
+-#else
+-	pthread_mutexattr_setkind_np(&MutexAttr, PTHREAD_MUTEX_RECURSIVE_NP);
+-#endif
++		pthread_mutexattr_settype(&MutexAttr, PTHREAD_MUTEX_RECURSIVE);
+ 	
+ 	pthread_mutex_init(NewMutex, &MutexAttr);
+ 	Mutex->Mutex = NewMutex;
+@@ -509,7 +514,7 @@ void AudioSleep(INT	ms)
+ // Blocks until audio device is ready for another mixed buffer.
+ INT AudioWait()
+ {
+-#if defined(__ANDROID__)
++#if defined(UT99_SDL_AUDIO)
+ 	if( AndroidAudioDevice && AudioInitialized )
+ 	{
+ 		UT99AndroidWaitForQueueSpacePerfA();
+diff --git a/third_party/ut99dc/Source/Audio/Src/AudioSubsystem.cpp b/third_party/ut99dc/Source/Audio/Src/AudioSubsystem.cpp
+index 7b47179..ce4425c 100644
+--- a/third_party/ut99dc/Source/Audio/Src/AudioSubsystem.cpp
++++ b/third_party/ut99dc/Source/Audio/Src/AudioSubsystem.cpp
+@@ -415,7 +415,9 @@ UBOOL UGenericAudioSubsystem::PlaySound
+ 
+ 	// If no sound, or its priority is overruled, stop it.
+ 	if( Index==-1 )
++	{
+ 		return 0;
++	}
+ 
+ 	// Put the sound on the play-list.
+ 	StopSound( Index );
+diff --git a/third_party/ut99dc/Source/CMakeLists.txt b/third_party/ut99dc/Source/CMakeLists.txt
+index ce20bb5..f5f9be7 100644
+--- a/third_party/ut99dc/Source/CMakeLists.txt
++++ b/third_party/ut99dc/Source/CMakeLists.txt
+@@ -272,11 +272,18 @@ if(BUILD_NOPENGLDRV)
+   list(APPEND INSTALL_TARGETS OpenGLDrv)
+ endif()
+ 
+-if(NOT PLATFORM_DREAMCAST)
++option(BUILD_NOPENGLESDRV "Build NOpenGLESDrv" ON)
++if(NOT PLATFORM_DREAMCAST AND BUILD_NOPENGLESDRV)
+   add_subdirectory(NOpenGLESDrv)
+   list(APPEND INSTALL_TARGETS NOpenGLESDrv)
+ endif()
+ 
++option(BUILD_NVULKANDRV "Build NVulkanDrv" ON)
++if(BUILD_NVULKANDRV AND NOT PLATFORM_DREAMCAST)
++  add_subdirectory(NVulkanDrv)
++  list(APPEND INSTALL_TARGETS NVulkanDrv)
++endif()
++
+ if(BUILD_PVRDRV)
+   add_subdirectory(PVRDrv)
+   list(APPEND INSTALL_TARGETS PVRDrv)
+diff --git a/third_party/ut99dc/Source/Core/Inc/FFileManagerLinux.h b/third_party/ut99dc/Source/Core/Inc/FFileManagerLinux.h
+index 0e1659d..ad0d068 100644
+--- a/third_party/ut99dc/Source/Core/Inc/FFileManagerLinux.h
++++ b/third_party/ut99dc/Source/Core/Inc/FFileManagerLinux.h
+@@ -10,6 +10,7 @@
+ #include <unistd.h>
+ #include <sys/stat.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <cerrno>
+ #include <cstring>
+@@ -50,6 +51,19 @@ static inline UBOOL UT99ShouldProfileFileLinux( const TCHAR* Filename, INT Size
+ 		|| !strcasecmp(Dot, ".umx");
+ }
+ 
++// PS5 port: a title cannot chdir into its writable folder, so relative names are resolved against UT99_BASEDIR
++// (set by the launcher) instead of the working directory. Without the variable nothing changes.
++static inline const char* UT99ResolveFile( const TCHAR* Filename )
++{
++	static __thread char Buffer[1100];
++	const char* Name = TCHAR_TO_ANSI(Filename);
++	const char* Base = getenv("UT99_BASEDIR");
++	if( !Base || !Base[0] || !Name || Name[0]=='/' )
++		return Name;
++	snprintf( Buffer, sizeof(Buffer), "%s%s", Base, Name );
++	return Buffer;
++}
++
+ class FArchiveFileReader : public FArchive
+ {
+ public:
+@@ -322,7 +336,7 @@ public:
+ 	{
+ 		guard(FFileManagerLinux::CreateFileReader);
+ 		DOUBLE OpenStart = UT99LoadProfSeconds();
+-		FILE* File = fopen(TCHAR_TO_ANSI(Filename), TCHAR_TO_ANSI(TEXT("rb")));
++		FILE* File = fopen(UT99ResolveFile(Filename), "rb");
+ 		if( !File )
+ 		{
+ 			if( Flags & FILEREAD_NoFail )
+@@ -347,13 +361,13 @@ public:
+ 		if( Flags & FILEWRITE_EvenIfReadOnly )
+ 		{
+ #ifndef PLATFORM_DREAMCAST
+-			chmod(TCHAR_TO_ANSI(Filename), S_IRUSR | S_IWUSR);
++			chmod(UT99ResolveFile(Filename), S_IRUSR | S_IWUSR);
+ #endif
+ 		}
+ 		if( (Flags & FILEWRITE_NoReplaceExisting) && FileSize(Filename)>=0 )
+ 			return NULL;
+ 		const TCHAR* Mode = (Flags & FILEWRITE_Append) ? TEXT("ab") : TEXT("wb"); 
+-		FILE* File = fopen(TCHAR_TO_ANSI(Filename),TCHAR_TO_ANSI(Mode));
++		FILE* File = fopen(UT99ResolveFile(Filename),TCHAR_TO_ANSI(Mode));
+ 		if( !File )
+ 		{
+ 			if( Flags & FILEWRITE_NoFail )
+@@ -371,10 +385,10 @@ public:
+ 		if( EvenReadOnly )
+ 		{
+ #ifndef PLATFORM_DREAMCAST
+-			chmod(TCHAR_TO_ANSI(Filename), S_IRUSR | S_IWUSR);
++			chmod(UT99ResolveFile(Filename), S_IRUSR | S_IWUSR);
+ #endif
+ 		}
+-		return unlink(TCHAR_TO_ANSI(Filename))==0 || (errno==ENOENT && !RequireExists);
++		return unlink(UT99ResolveFile(Filename))==0 || (errno==ENOENT && !RequireExists);
+ 		unguard;
+ 	}
+ 	SQWORD GetGlobalTime( const TCHAR* Filename )
+@@ -398,7 +412,7 @@ public:
+ 		guard(FFileManagerLinux::MakeDirectory);
+ 		if( Tree )
+ 			return FFileManagerGeneric::MakeDirectory( Path, Tree );
+-		return mkdir(TCHAR_TO_ANSI(Path), S_IRUSR | S_IWUSR | S_IXUSR)==0 || errno==EEXIST;
++		return mkdir(UT99ResolveFile(Path), S_IRUSR | S_IWUSR | S_IXUSR)==0 || errno==EEXIST;
+ 		unguard;
+ 	}
+ 	UBOOL DeleteDirectory( const TCHAR* Path, UBOOL RequireExists=0, UBOOL Tree=0 )
+@@ -406,7 +420,7 @@ public:
+ 		guard(FFileManagerLinux::DeleteDirectory);
+ 		if( Tree )
+ 			return FFileManagerGeneric::DeleteDirectory( Path, RequireExists, Tree );
+-		return rmdir(TCHAR_TO_ANSI(Path))==0 || (errno==ENOENT && !RequireExists);
++		return rmdir(UT99ResolveFile(Path))==0 || (errno==ENOENT && !RequireExists);
+ 		unguard;
+ 	}
+ 	TArray<FString> FindFiles( const TCHAR* Filename, UBOOL Files, UBOOL Directories )
+@@ -423,7 +437,7 @@ public:
+ 		UBOOL Match;
+ 
+ 		// Initialize Path to Filename.
+-		appStrcpy( Path, Filename );
++		appStrcpy( Path, appFromAnsi( UT99ResolveFile(Filename) ) );
+ 
+ 		// Convert MS "\" to Unix "/".
+ 		for( Cur = Path; *Cur != '\0'; Cur++ )
+diff --git a/third_party/ut99dc/Source/Core/Inc/FOutputDeviceFile.h b/third_party/ut99dc/Source/Core/Inc/FOutputDeviceFile.h
+index 84ab335..f6b7312 100644
+--- a/third_party/ut99dc/Source/Core/Inc/FOutputDeviceFile.h
++++ b/third_party/ut99dc/Source/Core/Inc/FOutputDeviceFile.h
+@@ -35,6 +35,16 @@ public:
+ 		{
+ 			if( !FName::SafeSuppressed(Event) )
+ 			{
++#ifdef UT99_PS5_PAD
++				// PS5 port: the engine's own log file is not written. Its unbuffered writes (four system calls
++				// a line) were seen to stall the game thread for about 2.9 s now and then; the line goes to the
++				// one port log (stderr) instead.
++				if( Event!=NAME_Title )
++					fprintf( stderr, "[engine] %s: %s\n", FName::SafeString(Event), Data );
++				if( GLogHook )
++					GLogHook->Serialize( Data, Event );
++				return;
++#endif
+ 				if( !LogAr && !Dead )
+ 				{
+ 					// Make log filename.
+@@ -78,6 +88,11 @@ public:
+ 					WriteRaw( TEXT(": ") );
+ 					WriteRaw( Data );
+ 					WriteRaw( LINE_TERMINATOR );
++#endif
++#if !UNICODE
++					// PS5 port: the launcher points stderr at the one port log (data/ut99.log).
++					if( getenv("UT99_LOG_STDERR") )
++						fprintf( stderr, "[engine] %s: %s\n", FName::SafeString(Event), Data );
+ #endif
+ 				}
+ 				if( GLogHook )
+diff --git a/third_party/ut99dc/Source/Core/Inc/UT99LoadProfiler.h b/third_party/ut99dc/Source/Core/Inc/UT99LoadProfiler.h
+index 5938a88..033806a 100644
+--- a/third_party/ut99dc/Source/Core/Inc/UT99LoadProfiler.h
++++ b/third_party/ut99dc/Source/Core/Inc/UT99LoadProfiler.h
+@@ -44,6 +44,9 @@ static inline DOUBLE UT99LoadProfSeconds()
+ #ifdef PLATFORM_ANDROID
+ #define UT99_LOADPROF_LOG(Fmt, ...) \
+ 	do { __android_log_print(ANDROID_LOG_INFO, "UT99_LOADPROF", Fmt, ##__VA_ARGS__); } while(0)
++#elif defined(UT99_PS5_PAD)
++// PS5 port: the load profile lines are not wanted in the port log.
++#define UT99_LOADPROF_LOG(Fmt, ...) do { } while(0)
+ #else
+ #define UT99_LOADPROF_LOG(Fmt, ...) \
+ 	do { printf("UT99_LOADPROF " Fmt "\n", ##__VA_ARGS__); fflush(stdout); } while(0)
+diff --git a/third_party/ut99dc/Source/Core/Inc/UnGnuG.h b/third_party/ut99dc/Source/Core/Inc/UnGnuG.h
+index 0382964..40ef19f 100644
+--- a/third_party/ut99dc/Source/Core/Inc/UnGnuG.h
++++ b/third_party/ut99dc/Source/Core/Inc/UnGnuG.h
+@@ -18,14 +18,23 @@
+ #endif
+ 
+ #include <stdarg.h>
++#include <time.h>
++#include <sys/time.h>
++#include <sys/stat.h>   // before UnFile.h defines clock()
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#if defined(__FreeBSD__)
++#include <stdlib.h>
++#else
+ #include <alloca.h>
++#endif
+ #include <string.h>
+ #include <strings.h>
+ #include <ctype.h>
++#if !defined(__FreeBSD__)
+ #include <malloc.h>
++#endif
+ #include <dirent.h>
+ #ifdef PLATFORM_WIN32
+ #include <minwindef.h>
+diff --git a/third_party/ut99dc/Source/Core/Src/UnAnsi.cpp b/third_party/ut99dc/Source/Core/Src/UnAnsi.cpp
+index 5882675..8f49e83 100644
+--- a/third_party/ut99dc/Source/Core/Src/UnAnsi.cpp
++++ b/third_party/ut99dc/Source/Core/Src/UnAnsi.cpp
+@@ -22,7 +22,9 @@
+ #include <string.h>
+ #include <errno.h>
+ #include <time.h>
++#if !defined(__FreeBSD__)
+ #include <malloc.h>
++#endif
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ 
+diff --git a/third_party/ut99dc/Source/Core/Src/UnObj.cpp b/third_party/ut99dc/Source/Core/Src/UnObj.cpp
+index 1d6686c..bd540f7 100644
+--- a/third_party/ut99dc/Source/Core/Src/UnObj.cpp
++++ b/third_party/ut99dc/Source/Core/Src/UnObj.cpp
+@@ -3595,7 +3595,8 @@ void UObject::CacheDrivers( UBOOL ForceRefresh )
+ 		{for( INT i=0; i<GSys->Paths.Num(); i++ )
+ 		{
+ 			TCHAR Filename[256];
+-			appSprintf( Filename, TEXT("%s%s"), appBaseDir(), *GSys->Paths(i) );
++			// PS5 port: Paths may be absolute (the game folder is read-only); the base directory only prefixes relative ones.
++			appSprintf( Filename, TEXT("%s%s"), ((*GSys->Paths(i))[0]=='/') ? TEXT("") : appBaseDir(), *GSys->Paths(i) );
+ 			TCHAR* Tmp = appStrstr( Filename, TEXT("*.") );
+ 			if( Tmp )
+ 			{
+diff --git a/third_party/ut99dc/Source/Core/Src/UnUnix.cpp b/third_party/ut99dc/Source/Core/Src/UnUnix.cpp
+index b8bad81..5a293a6 100644
+--- a/third_party/ut99dc/Source/Core/Src/UnUnix.cpp
++++ b/third_party/ut99dc/Source/Core/Src/UnUnix.cpp
+@@ -628,8 +628,13 @@ CORE_API const char* appBaseDir()
+ 
+ 	if( !BaseDir[0] )
+ 	{
++#if defined(PLATFORM_ANDROID) || !defined(PLATFORM_DREAMCAST)
++		// PS5 port: a title cannot rely on SDL_GetBasePath or the working directory, the launcher says where System/ is.
++		const char* AndroidBaseDir = getenv("UT99_BASEDIR");
+ #if defined(PLATFORM_ANDROID)
+-		const char* AndroidBaseDir = getenv("UT99_ANDROID_BASEDIR");
++		if( !AndroidBaseDir || !AndroidBaseDir[0] )
++			AndroidBaseDir = getenv("UT99_ANDROID_BASEDIR");
++#endif
+ 		if( AndroidBaseDir && AndroidBaseDir[0] )
+ 		{
+ 			appStrncpy( BaseDir, AndroidBaseDir, sizeof(BaseDir) );
+diff --git a/third_party/ut99dc/Source/NOpenGLESDrv/CMakeLists.txt b/third_party/ut99dc/Source/NOpenGLESDrv/CMakeLists.txt
+index 7c7d7ca..2b4d125 100644
+--- a/third_party/ut99dc/Source/NOpenGLESDrv/CMakeLists.txt
++++ b/third_party/ut99dc/Source/NOpenGLESDrv/CMakeLists.txt
+@@ -35,6 +35,8 @@ target_link_libraries(${PROJECT_NAME} ${SDL2_LIBRARY})
+ 
+ if(ANDROID)
+   target_link_libraries(${PROJECT_NAME} GLESv2 log android)
++else()
++  target_link_libraries(${PROJECT_NAME} GLESv2)
+ endif()
+ 
+ target_link_libraries(${PROJECT_NAME} Render Engine Core)
+diff --git a/third_party/ut99dc/Source/NOpenGLESDrv/NOpenGLESDrv.cpp b/third_party/ut99dc/Source/NOpenGLESDrv/NOpenGLESDrv.cpp
+index 66d6034..c356751 100644
+--- a/third_party/ut99dc/Source/NOpenGLESDrv/NOpenGLESDrv.cpp
++++ b/third_party/ut99dc/Source/NOpenGLESDrv/NOpenGLESDrv.cpp
+@@ -79,6 +79,9 @@ static constexpr DWORD AttribSizes[AT_Count] = {
+ #define MAX_VERTS 32768
+ 
+ 
++#ifndef PLATFORM_ANDROID
++static UBOOL UT99AndroidReadWidescreenFOVConfigV159( UBOOL DefaultValue ) { return DefaultValue; }
++#endif
+ #ifdef PLATFORM_ANDROID
+ static FLOAT UT99AndroidCalcWidescreenFOVV159( FLOAT BaseFOV, FLOAT FrameX, FLOAT FrameY )
+ {
+@@ -616,6 +619,29 @@ void UNOpenGLESRenderDevice::Unlock( UBOOL Blit )
+ 
+ 	glFlush();
+ 
++	// Debug: UT99_DUMP_FRAME=N, UT99_DUMP_PATH=file.ppm writes frame N as PPM (every Nth after, no)
++	{
++		static const char* DumpFrame = getenv( "UT99_DUMP_FRAME" );
++		static const char* DumpPath = getenv( "UT99_DUMP_PATH" );
++		if( DumpFrame && DumpPath && UnlockCount == atoi( DumpFrame ) )
++		{
++			INT W = Viewport->SizeX, H = Viewport->SizeY;
++			BYTE* Px = (BYTE*)appMalloc( W*H*4, "DumpPx" );
++			glReadPixels( 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, Px );
++			FILE* F = fopen( DumpPath, "wb" );
++			if( F )
++			{
++				fprintf( F, "P6\n%d %d\n255\n", W, H );
++				for( INT y=H-1; y>=0; y-- )
++					for( INT x=0; x<W; x++ )
++						fwrite( Px + (y*W+x)*4, 1, 3, F );
++				fclose( F );
++			}
++			appFree( Px );
++			debugf( NAME_Log, TEXT("NOpenGLESDrv: dumped frame %d"), UnlockCount );
++		}
++	}
++
+ 	unguard;
+ }
+ 
+diff --git a/third_party/ut99dc/Source/NSDLDrv/Src/NSDLClient.cpp b/third_party/ut99dc/Source/NSDLDrv/Src/NSDLClient.cpp
+index 02f3004..c462e72 100644
+--- a/third_party/ut99dc/Source/NSDLDrv/Src/NSDLClient.cpp
++++ b/third_party/ut99dc/Source/NSDLDrv/Src/NSDLClient.cpp
+@@ -86,6 +86,7 @@ void UNSDLClient::Init( UEngine* InEngine )
+ 
+ 	if( SDL_NumJoysticks() > 0 )
+ 		Controller = SDL_GameControllerOpen( 0 );
++	debugf( NAME_Init, TEXT("SDL joysticks: %d, game controller %s"), SDL_NumJoysticks(), Controller ? TEXT("opened") : TEXT("NOT opened") );
+ 
+ 	SDL_GameControllerEventState( SDL_ENABLE );
+ 
+diff --git a/third_party/ut99dc/Source/NSDLDrv/Src/NSDLViewport.cpp b/third_party/ut99dc/Source/NSDLDrv/Src/NSDLViewport.cpp
+index 312b5ec..3a9cffe 100644
+--- a/third_party/ut99dc/Source/NSDLDrv/Src/NSDLViewport.cpp
++++ b/third_party/ut99dc/Source/NSDLDrv/Src/NSDLViewport.cpp
+@@ -51,6 +51,12 @@ static volatile int GUT99AndroidImeOpenV79 = 0;
+ 
+ #include "NSDLDrv.h"
+ 
++#ifndef PLATFORM_ANDROID
++// Host (non-Android) stubs for Android-only helpers
++#define UT99_ANDROID_SDL_LOGI(...) ((void)0)
++static inline UBOOL UT99AndroidInsertFocusedEditBoxCharV83( BYTE ) { return 0; }
++#endif
++
+ // UT99_ANDROID_V111_OUYA_KEYBOARD_BUILDFIX: used by early keyboard helpers and later input paths.
+ static UBOOL GUT99V79OuyaLikeDevice = 0;
+ #if defined(__ANDROID__)
+@@ -4529,6 +4535,7 @@ void UNSDLViewport::AndroidNativeMouseDeltaV112( DWORD MouseFlags, INT DX, INT D
+ 	unguard;
+ }
+ 
++#ifdef PLATFORM_ANDROID
+ void UNSDLViewport::AndroidUpdateNativeMouseCaptureV113( UBOOL bMenuMode )
+ {
+ 	guard(UNSDLViewport::AndroidUpdateNativeMouseCaptureV113);
+@@ -4600,6 +4607,9 @@ void UNSDLViewport::AndroidUpdateNativeMouseCaptureV113( UBOOL bMenuMode )
+ 	}
+ 	unguard;
+ }
++#else
++void UNSDLViewport::AndroidUpdateNativeMouseCaptureV113( UBOOL ) {}
++#endif
+ 
+ UBOOL UNSDLViewport::CauseInputEvent( INT iKey, EInputAction Action, FLOAT Delta )
+ {
+@@ -4614,6 +4624,405 @@ UBOOL UNSDLViewport::CauseInputEvent( INT iKey, EInputAction Action, FLOAT Delta
+ 	unguard;
+ }
+ 
++#ifdef UT99_PS5_PAD
++// PS5 port: UWindow only draws its software cursor while bWindowsMouseAvailable is 0, and then takes the
++// position from WindowConsole.MouseX/MouseY (UWindow units). Copies of the Android build's helpers for that.
++static UViewport* GUT99Ps5MenuViewportPerfA = NULL;
++static UClass* GUT99Ps5ConsoleClassPerfA = NULL;
++static UBOOL GUT99Ps5ConsoleIsWindowPerfA = 0;
++static UObjectProperty* GUT99Ps5ConsoleRootPropPerfA = NULL;
++static UFloatProperty* GUT99Ps5ConsoleMouseXPropPerfA = NULL;
++static UFloatProperty* GUT99Ps5ConsoleMouseYPropPerfA = NULL;
++static UClass* GUT99Ps5RootClassPerfA = NULL;
++static UFloatProperty* GUT99Ps5RootScalePropPerfA = NULL;
++
++static UProperty* UT99Ps5FindClassPropertyPerfA( UClass* Class, const TCHAR* Name, UClass* PropClass )
++{
++    if( !Class || !Name )
++        return NULL;
++    for( TFieldIterator<UProperty> It( Class ); It; ++It )
++    {
++        UProperty* Prop = *It;
++        if( Prop && appStricmp( Prop->GetName(), Name ) == 0 && Prop->IsA( PropClass ) )
++            return Prop;
++    }
++    return NULL;
++}
++
++static UObject* UT99Ps5WindowConsolePerfA()
++{
++    UViewport* Viewport = GUT99Ps5MenuViewportPerfA;
++    UObject* Console = Viewport ? (UObject*)Viewport->Console : NULL;
++    if( !Console || !Console->GetClass() )
++        return NULL;
++
++    UClass* Class = Console->GetClass();
++    if( Class != GUT99Ps5ConsoleClassPerfA )
++    {
++        GUT99Ps5ConsoleClassPerfA = Class;
++        GUT99Ps5ConsoleIsWindowPerfA = 0;
++        for( UClass* Cls = Class; Cls; Cls = Cls->GetSuperClass() )
++        {
++            const TCHAR* ClassName = Cls->GetName();
++            if( ClassName && appStrstr( ClassName, TEXT("WindowConsole") ) )
++            {
++                GUT99Ps5ConsoleIsWindowPerfA = 1;
++                break;
++            }
++        }
++        GUT99Ps5ConsoleRootPropPerfA = (UObjectProperty*)UT99Ps5FindClassPropertyPerfA( Class, TEXT("Root"), UObjectProperty::StaticClass() );
++        GUT99Ps5ConsoleMouseXPropPerfA = (UFloatProperty*)UT99Ps5FindClassPropertyPerfA( Class, TEXT("MouseX"), UFloatProperty::StaticClass() );
++        GUT99Ps5ConsoleMouseYPropPerfA = (UFloatProperty*)UT99Ps5FindClassPropertyPerfA( Class, TEXT("MouseY"), UFloatProperty::StaticClass() );
++    }
++    return GUT99Ps5ConsoleIsWindowPerfA ? Console : NULL;
++}
++
++static UObject* UT99Ps5UWindowRootPerfA()
++{
++    UObject* Console = UT99Ps5WindowConsolePerfA();
++    if( !Console || !GUT99Ps5ConsoleRootPropPerfA )
++        return NULL;
++    UObject* Root = NULL;
++    appMemcpy( &Root, (BYTE*)Console + GUT99Ps5ConsoleRootPropPerfA->Offset, sizeof(Root) );
++    return Root;
++}
++
++static FLOAT UT99Ps5UWindowScalePerfA( UObject* Root )
++{
++    if( !Root || !Root->GetClass() )
++        return 1.0f;
++    if( Root->GetClass() != GUT99Ps5RootClassPerfA )
++    {
++        GUT99Ps5RootClassPerfA = Root->GetClass();
++        GUT99Ps5RootScalePropPerfA = (UFloatProperty*)UT99Ps5FindClassPropertyPerfA( Root->GetClass(), TEXT("GUIScale"), UFloatProperty::StaticClass() );
++    }
++    if( !GUT99Ps5RootScalePropPerfA )
++        return 1.0f;
++    const FLOAT Scale = *(FLOAT*)((BYTE*)Root + GUT99Ps5RootScalePropPerfA->Offset);
++    return Scale < 0.25f ? 1.0f : Scale;
++}
++
++static UBOOL UT99Ps5SetConsoleMouseUIPerfA( FLOAT UIX, FLOAT UIY )
++{
++    UObject* Console = UT99Ps5WindowConsolePerfA();
++    if( !Console || !GUT99Ps5ConsoleMouseXPropPerfA || !GUT99Ps5ConsoleMouseYPropPerfA )
++        return 0;
++    *(FLOAT*)((BYTE*)Console + GUT99Ps5ConsoleMouseXPropPerfA->Offset) = UIX;
++    *(FLOAT*)((BYTE*)Console + GUT99Ps5ConsoleMouseYPropPerfA->Offset) = UIY;
++    return 1;
++}
++
++static UBOOL UT99Ps5SetWindowConsoleMouseV91( FLOAT X, FLOAT Y )
++{
++    // X/Y are viewport pixels; WindowConsole.MouseX/MouseY are UWindow units,
++    // exactly as RenderUWindow() derives them from WindowsMouseX/GUIScale.
++    const FLOAT Scale = UT99Ps5UWindowScalePerfA( UT99Ps5UWindowRootPerfA() );
++    return UT99Ps5SetConsoleMouseUIPerfA( X / Scale, Y / Scale );
++}
++#endif
++
++#ifdef UT99_PS5_PAD
++static UBOOL GPs5L3Held = 0;   // L3 is a modifier (L3 + d-pad left/right = field of view), not crouch
++static INT   GPs5HeldKey[SDL_CONTROLLER_BUTTON_MAX];   // key each button pressed, so its release matches
++static FLOAT GPs5Axis[SDL_CONTROLLER_AXIS_MAX];
++static UBOOL GPs5StickUp, GPs5StickDown, GPs5StickLeft, GPs5StickRight, GPs5TriggerL, GPs5TriggerR;
++static FLOAT GPs5CursorX, GPs5CursorY;
++static UBOOL GPs5CursorInit;
++#endif
++
++#ifdef UT99_PS5_PAD
++// ---- PS5 on-screen keyboard (glue/ps5_keyboard.cpp draws it over the frame and reads the pad) ----------------
++// A click with the pad's A button on a text field (UWindowEditBox) opens it; its text is typed into the field
++// when it closes with OK. Copies of the Android build's helpers for finding the field.
++extern "C" {
++int  ut_ps5_kb_active(void);
++void ut_ps5_kb_open(const char* Initial, unsigned MaxChars);
++int  ut_ps5_kb_button(int Button);
++void ut_ps5_kb_axis(int Axis, int Value);
++int  ut_ps5_kb_result(char* Out, int Capacity);
++}
++
++static UObject* GUT99Ps5KbTarget = NULL;
++static INT      GUT99Ps5KbTargetIndex = INDEX_NONE;
++static DOUBLE   GUT99Ps5KbCheckAt = 0.0;     // when to look at what the last A press clicked
++
++static UBOOL UT99Ps5ClassHasName( UObject* Obj, const TCHAR* Needle )
++{
++    if( !Obj || !Obj->GetClass() || !Needle )
++        return 0;
++    for( UClass* Cls = Obj->GetClass(); Cls; Cls = Cls->GetSuperClass() )
++    {
++        const TCHAR* ClassName = Cls->GetName();
++        if( ClassName && appStrstr( ClassName, Needle ) )
++            return 1;
++    }
++    return 0;
++}
++
++static UBOOL UT99Ps5GetBoolProp( UObject* Obj, const TCHAR* Name, UBOOL Default )
++{
++    UBoolProperty* Prop = (UBoolProperty*)UT99Ps5FindClassPropertyPerfA( Obj ? Obj->GetClass() : NULL, Name, UBoolProperty::StaticClass() );
++    if( !Prop )
++        return Default;
++    return ( ( *(DWORD*)((BYTE*)Obj + Prop->Offset) & Prop->BitMask ) != 0 ) ? 1 : 0;
++}
++
++static INT UT99Ps5GetIntProp( UObject* Obj, const TCHAR* Name, INT Default )
++{
++    UIntProperty* Prop = (UIntProperty*)UT99Ps5FindClassPropertyPerfA( Obj ? Obj->GetClass() : NULL, Name, UIntProperty::StaticClass() );
++    return Prop ? *(INT*)((BYTE*)Obj + Prop->Offset) : Default;
++}
++
++static UObject* UT99Ps5GetObjectProp( UObject* Obj, const TCHAR* Name )
++{
++    UObjectProperty* Prop = (UObjectProperty*)UT99Ps5FindClassPropertyPerfA( Obj ? Obj->GetClass() : NULL, Name, UObjectProperty::StaticClass() );
++    return Prop ? *(UObject**)((BYTE*)Obj + Prop->Offset) : NULL;
++}
++
++static FString* UT99Ps5GetStringProp( UObject* Obj, const TCHAR* Name )
++{
++    UStrProperty* Prop = (UStrProperty*)UT99Ps5FindClassPropertyPerfA( Obj ? Obj->GetClass() : NULL, Name, UStrProperty::StaticClass() );
++    return Prop ? (FString*)((BYTE*)Obj + Prop->Offset) : NULL;
++}
++
++static UBOOL UT99Ps5ObjectAlive( UObject* Obj, INT Index )
++{
++    return Obj && Index != INDEX_NONE && UObject::GetIndexedObject( Index ) == Obj
++        && !( Obj->GetFlags() & ( RF_Unreachable | RF_Destroyed ) );
++}
++
++// The text field under the UWindow cursor: the edit box itself, or its UWindowEditControl (label and frame).
++static UObject* UT99Ps5EditBoxUnderCursor()
++{
++    UObject* Console = UT99Ps5WindowConsolePerfA();
++    UObject* Root = UT99Ps5UWindowRootPerfA();
++    if( !Console || !Root || !GUT99Ps5ConsoleMouseXPropPerfA || !GUT99Ps5ConsoleMouseYPropPerfA )
++        return NULL;
++    UFunction* FindWindowUnder = Root->FindFunction( FName(TEXT("FindWindowUnder"), FNAME_Find) );
++    if( !FindWindowUnder )
++        return NULL;
++    struct FFindWindowUnderParms { FLOAT X; FLOAT Y; UObject* ReturnValue; } Parms;
++    appMemzero( &Parms, sizeof(Parms) );
++    Parms.X = *(FLOAT*)((BYTE*)Console + GUT99Ps5ConsoleMouseXPropPerfA->Offset);
++    Parms.Y = *(FLOAT*)((BYTE*)Console + GUT99Ps5ConsoleMouseYPropPerfA->Offset);
++    Root->ProcessEvent( FindWindowUnder, &Parms );
++    UObject* Window = Parms.ReturnValue;
++    if( !Window )
++        return NULL;
++    if( UT99Ps5ClassHasName( Window, TEXT("EditBox") ) )
++        return Window;
++    if( UT99Ps5ClassHasName( Window, TEXT("EditControl") ) )
++    {
++        UObject* EditBox = UT99Ps5GetObjectProp( Window, TEXT("EditBox") );
++        if( EditBox && UT99Ps5ClassHasName( EditBox, TEXT("EditBox") ) )
++            return EditBox;
++    }
++    return NULL;
++}
++
++// Looks at what the pad's last A press clicked; opens the keyboard when that is a text field that can be edited.
++static void UT99Ps5OpenKeyboardForClickedField()
++{
++    UObject* EditBox = UT99Ps5EditBoxUnderCursor();
++    if( !EditBox || !UT99Ps5GetBoolProp( EditBox, TEXT("bCanEdit"), 1 ) )
++        return;
++    FString* Value = UT99Ps5GetStringProp( EditBox, TEXT("Value") );
++    INT MaxLength = UT99Ps5GetIntProp( EditBox, TEXT("MaxLength"), 0 );
++    GUT99Ps5KbTarget = EditBox;
++    GUT99Ps5KbTargetIndex = (INT)EditBox->GetIndex();
++    for( INT i = 0; i < SDL_CONTROLLER_AXIS_MAX; ++i )
++        GPs5Axis[i] = 0.0f;           // the sticks drive the keyboard now, not the menu cursor
++    ut_ps5_kb_open( Value ? TCHAR_TO_ANSI( **Value ) : "", MaxLength > 0 ? (unsigned)MaxLength : 0u );
++    debugf( NAME_Log, TEXT("PS5 keyboard: opened for %s (max %d)"), EditBox->GetClass()->GetName(), MaxLength );
++}
++
++// Replaces the field's text with what the keyboard returned (UWindowEditBox.Clear, then Insert per character).
++static void UT99Ps5TypeIntoField( const char* Text )
++{
++    UObject* EditBox = UT99Ps5ObjectAlive( GUT99Ps5KbTarget, GUT99Ps5KbTargetIndex ) ? GUT99Ps5KbTarget : NULL;
++    GUT99Ps5KbTarget = NULL;
++    GUT99Ps5KbTargetIndex = INDEX_NONE;
++    if( !EditBox )
++        return;
++    UFunction* ClearFn = EditBox->FindFunction( FName(TEXT("Clear"), FNAME_Find) );
++    UFunction* InsertFn = EditBox->FindFunction( FName(TEXT("Insert"), FNAME_Find) );
++    if( !ClearFn || !InsertFn )
++        return;
++    EditBox->ProcessEvent( ClearFn, NULL );
++    const UBOOL bNumericOnly = UT99Ps5GetBoolProp( EditBox, TEXT("bNumericOnly"), 0 );
++    const UBOOL bNumericFloat = UT99Ps5GetBoolProp( EditBox, TEXT("bNumericFloat"), 0 );
++    for( const char* C = Text; *C; ++C )
++    {
++        if( bNumericOnly && !( ( *C >= '0' && *C <= '9' ) || ( *C == '.' && bNumericFloat ) ) )
++            continue;
++        struct FInsertParms { BYTE C; DWORD ReturnValue; } Parms;
++        Parms.C = (BYTE)*C;
++        Parms.ReturnValue = 0;
++        EditBox->ProcessEvent( InsertFn, &Parms );
++    }
++    debugf( NAME_Log, TEXT("PS5 keyboard: typed %d characters"), (INT)appStrlen( ANSI_TO_TCHAR( Text ) ) );
++}
++
++// ---- PS5 statistics overlay: the "Show Statistics" check box under "Use Dynamic Lighting" in Preferences > Video ----
++// UMenu.u is the stock package, so the check box is added to the open Video page from here: a UWindowCheckbox is
++// created on the page (UWindowDialogClientWindow.CreateControl), placed one row below the dynamic lighting box and
++// kept there; its state is read back every tick and kept in the ini (NSDLDrv.NSDLClient ShowStatistics).
++extern "C" {
++void ut_ps5_stats_set(int On);
++}
++
++struct FPs5StatsHost { UObject* Page; INT PageIndex; UObject* Check; INT CheckIndex; };
++static FPs5StatsHost GPs5StatsHosts[8];
++static INT   GPs5StatsHostCount = 0;
++static UBOOL GPs5StatsOn = 0;
++static UBOOL GPs5StatsInit = 0;
++static DOUBLE GPs5StatsScanAt = 0.0;
++
++static FLOAT* UT99Ps5FloatPropPtr( UObject* Obj, const TCHAR* Name )
++{
++    UFloatProperty* Prop = (UFloatProperty*)UT99Ps5FindClassPropertyPerfA( Obj ? Obj->GetClass() : NULL, Name, UFloatProperty::StaticClass() );
++    return Prop ? (FLOAT*)((BYTE*)Obj + Prop->Offset) : NULL;
++}
++
++static void UT99Ps5SetBoolProp( UObject* Obj, const TCHAR* Name, UBOOL Value )
++{
++    UBoolProperty* Prop = (UBoolProperty*)UT99Ps5FindClassPropertyPerfA( Obj ? Obj->GetClass() : NULL, Name, UBoolProperty::StaticClass() );
++    if( !Prop )
++        return;
++    DWORD* Word = (DWORD*)((BYTE*)Obj + Prop->Offset);
++    if( Value ) *Word |= Prop->BitMask; else *Word &= ~Prop->BitMask;
++}
++
++static void UT99Ps5SetStatistics( UBOOL On )
++{
++    GPs5StatsOn = On;
++    ut_ps5_stats_set( On ? 1 : 0 );
++    if( GConfig )
++    {
++        GConfig->SetBool( TEXT("NSDLDrv.NSDLClient"), TEXT("ShowStatistics"), On );
++        GConfig->Flush( 0 );
++    }
++}
++
++// Adds the check box to a Video page that does not have it yet.
++static void UT99Ps5AddStatsCheck( UObject* Page, FPs5StatsHost& Host )
++{
++    UObject* Dyn = UT99Ps5GetObjectProp( Page, TEXT("DynamicLightsCheck") );
++    UFunction* CreateFn = Page->FindFunction( FName(TEXT("CreateControl"), FNAME_Find) );
++    if( !Dyn || !CreateFn )
++        return;
++    FLOAT* DynLeft = UT99Ps5FloatPropPtr( Dyn, TEXT("WinLeft") );
++    FLOAT* DynTop  = UT99Ps5FloatPropPtr( Dyn, TEXT("WinTop") );
++    FLOAT* DynW    = UT99Ps5FloatPropPtr( Dyn, TEXT("WinWidth") );
++    FLOAT* DynH    = UT99Ps5FloatPropPtr( Dyn, TEXT("WinHeight") );
++    if( !DynLeft || !DynTop || !DynW || !DynH )
++        return;
++    struct FCreateControlParms { UClass* ControlClass; FLOAT X; FLOAT Y; FLOAT W; FLOAT H; UObject* OwnerWindow; UObject* ReturnValue; } Parms;
++    appMemzero( &Parms, sizeof(Parms) );
++    Parms.ControlClass = Dyn->GetClass();
++    Parms.X = *DynLeft; Parms.Y = *DynTop + 25.f; Parms.W = *DynW; Parms.H = *DynH;
++    Page->ProcessEvent( CreateFn, &Parms );
++    UObject* Check = Parms.ReturnValue;
++    if( !Check )
++        return;
++    UFunction* SetTextFn = Check->FindFunction( FName(TEXT("SetText"), FNAME_Find) );
++    if( SetTextFn )
++    {
++        struct FSetTextParms { FString NewText; } TextParms;
++        TextParms.NewText = TEXT("Show Statistics");
++        Check->ProcessEvent( SetTextFn, &TextParms );
++    }
++    UFunction* SetFontFn = Check->FindFunction( FName(TEXT("SetFont"), FNAME_Find) );
++    if( SetFontFn )
++    {
++        struct FSetFontParms { INT NewFont; } FontParms;
++        FontParms.NewFont = 0;   // F_Normal
++        Check->ProcessEvent( SetFontFn, &FontParms );
++    }
++    UByteProperty* AlignDyn = (UByteProperty*)UT99Ps5FindClassPropertyPerfA( Dyn->GetClass(), TEXT("Align"), UByteProperty::StaticClass() );
++    UByteProperty* AlignNew = (UByteProperty*)UT99Ps5FindClassPropertyPerfA( Check->GetClass(), TEXT("Align"), UByteProperty::StaticClass() );
++    if( AlignDyn && AlignNew )
++        *((BYTE*)Check + AlignNew->Offset) = *((BYTE*)Dyn + AlignDyn->Offset);
++    UT99Ps5SetBoolProp( Check, TEXT("bChecked"), GPs5StatsOn );
++    // The page scrolls by its desired height: one more row.
++    if( FLOAT* Desired = UT99Ps5FloatPropPtr( Page, TEXT("DesiredHeight") ) )
++        *Desired += 25.f;
++    Host.Page = Page; Host.PageIndex = (INT)Page->GetIndex();
++    Host.Check = Check; Host.CheckIndex = (INT)Check->GetIndex();
++    debugf( NAME_Log, TEXT("PS5 statistics: check box added to the Video page") );
++}
++
++// Every tick while a menu is up: finds Video pages, keeps the check box in place and reads its state.
++static void UT99Ps5UpdateStatsCheck( UBOOL bMenu )
++{
++    if( !GPs5StatsInit )
++    {
++        GPs5StatsInit = 1;
++        UBOOL On = 0;
++        if( GConfig )
++            GConfig->GetBool( TEXT("NSDLDrv.NSDLClient"), TEXT("ShowStatistics"), On );
++        GPs5StatsOn = On;
++        ut_ps5_stats_set( On ? 1 : 0 );
++    }
++    if( !bMenu )
++        return;
++    // Pages that closed (or were collected) leave the list.
++    for( INT i = GPs5StatsHostCount - 1; i >= 0; --i )
++        if( !UT99Ps5ObjectAlive( GPs5StatsHosts[i].Page, GPs5StatsHosts[i].PageIndex )
++         || !UT99Ps5ObjectAlive( GPs5StatsHosts[i].Check, GPs5StatsHosts[i].CheckIndex ) )
++            GPs5StatsHosts[i] = GPs5StatsHosts[--GPs5StatsHostCount];
++    const DOUBLE Now = appSeconds();
++    if( Now >= GPs5StatsScanAt && GPs5StatsHostCount < 8 )
++    {
++        GPs5StatsScanAt = Now + 0.4;
++        for( FObjectIterator It; It && GPs5StatsHostCount < 8; ++It )
++        {
++            UObject* Obj = *It;
++            if( !Obj || ( Obj->GetFlags() & ( RF_Unreachable | RF_Destroyed ) ) )
++                continue;
++            UClass* Cls = Obj->GetClass();
++            if( !Cls || appStricmp( Cls->GetName(), TEXT("UMenuVideoClientWindow") ) != 0 )
++                continue;
++            UBOOL Known = 0;
++            for( INT h = 0; h < GPs5StatsHostCount; ++h )
++                if( GPs5StatsHosts[h].Page == Obj ) { Known = 1; break; }
++            if( !Known && UT99Ps5GetObjectProp( Obj, TEXT("DynamicLightsCheck") ) )
++            {
++                FPs5StatsHost Host = { NULL, INDEX_NONE, NULL, INDEX_NONE };
++                UT99Ps5AddStatsCheck( Obj, Host );
++                if( Host.Check )
++                    GPs5StatsHosts[GPs5StatsHostCount++] = Host;
++            }
++        }
++    }
++    for( INT h = 0; h < GPs5StatsHostCount; ++h )
++    {
++        UObject* Page = GPs5StatsHosts[h].Page;
++        UObject* Check = GPs5StatsHosts[h].Check;
++        UObject* Dyn = UT99Ps5GetObjectProp( Page, TEXT("DynamicLightsCheck") );
++        if( Dyn )
++        {
++            FLOAT* L = UT99Ps5FloatPropPtr( Dyn, TEXT("WinLeft") );  FLOAT* T = UT99Ps5FloatPropPtr( Dyn, TEXT("WinTop") );
++            FLOAT* W = UT99Ps5FloatPropPtr( Dyn, TEXT("WinWidth") ); FLOAT* H = UT99Ps5FloatPropPtr( Dyn, TEXT("WinHeight") );
++            FLOAT* CL = UT99Ps5FloatPropPtr( Check, TEXT("WinLeft") );  FLOAT* CT = UT99Ps5FloatPropPtr( Check, TEXT("WinTop") );
++            FLOAT* CW = UT99Ps5FloatPropPtr( Check, TEXT("WinWidth") ); FLOAT* CH = UT99Ps5FloatPropPtr( Check, TEXT("WinHeight") );
++            if( L && T && W && H && CL && CT && CW && CH )
++            {
++                *CL = *L; *CT = *T + 25.f; *CW = *W; *CH = *H;
++            }
++        }
++        const UBOOL Checked = UT99Ps5GetBoolProp( Check, TEXT("bChecked"), GPs5StatsOn );
++        if( Checked != GPs5StatsOn )
++        {
++            UT99Ps5SetStatistics( Checked );
++            for( INT o = 0; o < GPs5StatsHostCount; ++o )   // other open pages follow
++                if( o != h ) UT99Ps5SetBoolProp( GPs5StatsHosts[o].Check, TEXT("bChecked"), Checked );
++            debugf( NAME_Log, TEXT("PS5 statistics: %s"), Checked ? TEXT("on") : TEXT("off") );
++        }
++    }
++}
++#endif
++
+ UBOOL UNSDLViewport::TickInput()
+ {
+ 	guard(UNSDLViewport::TickInput);
+@@ -5144,6 +5553,106 @@ while( SDL_PollEvent( &Ev ) )
+                 break;
+             }
+ #endif
++#ifdef UT99_PS5_PAD
++			// PS5 port: the pad is an SDL virtual game controller (ps5_io.cpp). Buttons and sticks become the keys and mouse
++			// axes that the stock v400 bindings use, so no bindings have to be set up: menu = cursor + click, game = move/look/fire.
++			case SDL_CONTROLLERBUTTONDOWN:
++			case SDL_CONTROLLERBUTTONUP:
++			{
++				const UBOOL bDown = ( Ev.type == SDL_CONTROLLERBUTTONDOWN );
++				const INT Button = Ev.cbutton.button;
++				if( Button < 0 || Button >= SDL_CONTROLLER_BUTTON_MAX )
++					break;
++				if( Button == SDL_CONTROLLER_BUTTON_LEFTSTICK )
++					GPs5L3Held = bDown && !bShowWindowsMouse;
++				if( !bDown )
++				{
++					if( GPs5HeldKey[Button] != IK_None )
++						CauseInputEvent( GPs5HeldKey[Button], IST_Release );
++					GPs5HeldKey[Button] = IK_None;
++					break;
++				}
++				if( ut_ps5_kb_active() )
++				{
++					// The on-screen keyboard has the pad: its buttons do not reach the game.
++					if( ut_ps5_kb_button( Button ) == 2 )
++					{
++						char Typed[128];
++						if( ut_ps5_kb_result( Typed, sizeof(Typed) ) )
++							UT99Ps5TypeIntoField( Typed );
++					}
++					break;
++				}
++				if( GPs5L3Held && ( Button == SDL_CONTROLLER_BUTTON_DPAD_LEFT || Button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT ) )
++				{
++					// Field of view in steps of 5 degrees (kept in the player's ini).
++					if( Actor )
++					{
++						FLOAT Fov = Actor->DefaultFOV;
++						if( Fov < 60.f || Fov > 140.f ) Fov = 90.f;
++						Fov = Clamp( Fov + ( Button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT ? 5.f : -5.f ), 70.f, 130.f );
++						Actor->DefaultFOV = Actor->DesiredFOV = Fov;
++						Actor->SaveConfig();
++						debugf( TEXT("PS5 pad: field of view %d"), (INT)Fov );
++					}
++					break;
++				}
++				if( bShowWindowsMouse && Button == SDL_CONTROLLER_BUTTON_A )
++					GUT99Ps5KbCheckAt = appSeconds() + 0.15;   // after the click: did it land on a text field?
++				INT Key = IK_None;
++				if( bShowWindowsMouse )
++				{
++					switch( Button )
++					{
++						case SDL_CONTROLLER_BUTTON_A:             Key = IK_LeftMouse; break;
++						case SDL_CONTROLLER_BUTTON_B:             Key = IK_Escape; break;
++						case SDL_CONTROLLER_BUTTON_X:             Key = IK_Enter; break;
++						case SDL_CONTROLLER_BUTTON_Y:             Key = IK_Escape; break;
++						case SDL_CONTROLLER_BUTTON_START:         Key = IK_Escape; break;
++						case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  Key = IK_PageUp; break;
++						case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: Key = IK_PageDown; break;
++						case SDL_CONTROLLER_BUTTON_DPAD_UP:       Key = IK_Up; break;
++						case SDL_CONTROLLER_BUTTON_DPAD_DOWN:     Key = IK_Down; break;
++						case SDL_CONTROLLER_BUTTON_DPAD_LEFT:     Key = IK_Left; break;
++						case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:    Key = IK_Right; break;
++					}
++				}
++				else
++				{
++					switch( Button )
++					{
++						case SDL_CONTROLLER_BUTTON_A:             Key = IK_Space; break;       // Jump
++						case SDL_CONTROLLER_BUTTON_B:             Key = IK_C; break;           // Duck
++						case SDL_CONTROLLER_BUTTON_X:             Key = IK_Enter; break;       // Activate item
++						case SDL_CONTROLLER_BUTTON_Y:             Key = IK_Slash; break;       // Next weapon
++						case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  Key = IK_Q; break;           // Translocator
++						case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: Key = IK_Slash; break;       // Next weapon
++						case SDL_CONTROLLER_BUTTON_RIGHTSTICK:    Key = IK_End; break;         // Center view
++						case SDL_CONTROLLER_BUTTON_BACK:          Key = IK_F1; break;          // Scores
++						case SDL_CONTROLLER_BUTTON_START:         Key = IK_Escape; break;      // Menu
++						case SDL_CONTROLLER_BUTTON_DPAD_UP:       Key = IK_Up; break;
++						case SDL_CONTROLLER_BUTTON_DPAD_DOWN:     Key = IK_Down; break;
++						case SDL_CONTROLLER_BUTTON_DPAD_LEFT:     Key = IK_Left; break;
++						case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:    Key = IK_Right; break;
++					}
++				}
++				if( Key != IK_None )
++				{
++					GPs5HeldKey[Button] = Key;
++					CauseInputEvent( Key, IST_Press );
++				}
++				break;
++			}
++			case SDL_CONTROLLERAXISMOTION:
++				if( ut_ps5_kb_active() )
++				{
++					ut_ps5_kb_axis( Ev.caxis.axis, Ev.caxis.value );
++					break;
++				}
++				if( Ev.caxis.axis < SDL_CONTROLLER_AXIS_MAX )
++					GPs5Axis[Ev.caxis.axis] = Clamp( (FLOAT)Ev.caxis.value / 32767.0f, -1.0f, 1.0f );
++				break;
++#else
+ 			case SDL_CONTROLLERBUTTONDOWN:
+ #if __ANDROID__
+         /* UT99_ANDROID_MENU_INPUT_V43_SDL_CONTROLLERBUTTONDOWN */
+@@ -5298,6 +5807,7 @@ while( SDL_PollEvent( &Ev ) )
+ 					JoyAxis[Ev.caxis.axis] = NewValue;
+ 				}
+ 				break;
++#endif /* UT99_PS5_PAD */
+ 			#ifdef PLATFORM_ANDROID
+             case SDL_FINGERDOWN:
+             {
+@@ -5638,6 +6148,66 @@ case SDL_MOUSEMOTION:
+ 	}
+ #endif
+ 
++#ifdef UT99_PS5_PAD
++	{
++		// Held state of the sticks and triggers (see the controller events above), applied once per tick.
++		const FLOAT Dead = 0.35f;
++		const FLOAT LX = GPs5Axis[SDL_CONTROLLER_AXIS_LEFTX], LY = GPs5Axis[SDL_CONTROLLER_AXIS_LEFTY];
++		const FLOAT RX = GPs5Axis[SDL_CONTROLLER_AXIS_RIGHTX], RY = GPs5Axis[SDL_CONTROLLER_AXIS_RIGHTY];
++		const UBOOL bMenu = bShowWindowsMouse ? 1 : 0;
++		struct FHold { static void Set( UNSDLViewport* V, UBOOL& State, UBOOL Want, INT Key )
++			{ if( State != Want ) { State = Want; V->CauseInputEvent( Key, Want ? IST_Press : IST_Release ); } } };
++		// Left stick walks and strafes (stock bindings: Up/Down/Left/Right); in a menu it moves the cursor instead.
++		FHold::Set( this, GPs5StickUp,    !bMenu && LY < -Dead, IK_Up );
++		FHold::Set( this, GPs5StickDown,  !bMenu && LY >  Dead, IK_Down );
++		FHold::Set( this, GPs5StickLeft,  !bMenu && LX < -Dead, IK_Left );
++		FHold::Set( this, GPs5StickRight, !bMenu && LX >  Dead, IK_Right );
++		// Triggers: right = fire, left = alt fire.
++		FHold::Set( this, GPs5TriggerR, GPs5Axis[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] > 0.3f, IK_LeftMouse );
++		FHold::Set( this, GPs5TriggerL, GPs5Axis[SDL_CONTROLLER_AXIS_TRIGGERLEFT]  > 0.3f, IK_RightMouse );
++		const FLOAT Dt = Clamp( DeltaTime, 0.0f, 0.1f );
++		GUT99Ps5MenuViewportPerfA = this;
++		UT99Ps5UpdateStatsCheck( bMenu );
++		if( GUT99Ps5KbCheckAt > 0.0 && appSeconds() >= GUT99Ps5KbCheckAt )
++		{
++			GUT99Ps5KbCheckAt = 0.0;
++			if( bMenu && !ut_ps5_kb_active() )
++				UT99Ps5OpenKeyboardForClickedField();
++		}
++		if( bMenu )
++		{
++			// Menu cursor: either stick moves UWindow's software cursor (see the helpers above).
++			FLOAT MX = LX, MY = LY;
++			if( Abs(RX) > Abs(MX) ) MX = RX;
++			if( Abs(RY) > Abs(MY) ) MY = RY;
++			if( Abs(MX) < 0.15f ) MX = 0.0f;
++			if( Abs(MY) < 0.15f ) MY = 0.0f;
++			if( !GPs5CursorInit )
++			{
++				GPs5CursorX = SizeX * 0.5f; GPs5CursorY = SizeY * 0.5f; GPs5CursorInit = 1;
++			}
++			bWindowsMouseAvailable = 0;
++			SelectedCursor = 0;
++			if( MX != 0.0f || MY != 0.0f )
++			{
++				GPs5CursorX = Clamp( GPs5CursorX + MX * Abs(MX) * 1100.0f * Dt, 0.0f, (FLOAT)(SizeX - 1) );
++				GPs5CursorY = Clamp( GPs5CursorY + MY * Abs(MY) * 1100.0f * Dt, 0.0f, (FLOAT)(SizeY - 1) );
++			}
++			WindowsMouseX = GPs5CursorX;
++			WindowsMouseY = GPs5CursorY;
++			UT99Ps5SetWindowConsoleMouseV91( GPs5CursorX, GPs5CursorY );
++		}
++		else
++		{
++			// Right stick looks around: mouse axis events, as the relative mouse does.
++			FLOAT DX = ( Abs(RX) > 0.15f ) ? RX * Abs(RX) : 0.0f;
++			FLOAT DY = ( Abs(RY) > 0.15f ) ? RY * Abs(RY) : 0.0f;
++			if( DX != 0.0f ) CauseInputEvent( IK_MouseX, IST_Axis, DX * 1300.0f * Dt );
++			if( DY != 0.0f ) CauseInputEvent( IK_MouseY, IST_Axis, -DY * 1000.0f * Dt );
++		}
++	}
++#endif
++
+ 	// Constantly hammer the input system with axis events for axes that are not zero.
+ 	for ( INT i = 0; i < SDL_CONTROLLER_AXIS_MAX; ++i )
+ 	{

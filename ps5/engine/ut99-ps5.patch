@@ -63,10 +63,32 @@ index 3ecf965..612bacc 100644
  	{
  		UT99AndroidWaitForQueueSpacePerfA();
 diff --git a/third_party/ut99dc/Source/Audio/Src/AudioSubsystem.cpp b/third_party/ut99dc/Source/Audio/Src/AudioSubsystem.cpp
-index 7b47179..ce4425c 100644
+index 7b47179..3981cec 100644
 --- a/third_party/ut99dc/Source/Audio/Src/AudioSubsystem.cpp
 +++ b/third_party/ut99dc/Source/Audio/Src/AudioSubsystem.cpp
-@@ -415,7 +415,9 @@ UBOOL UGenericAudioSubsystem::PlaySound
+@@ -330,13 +330,18 @@ void UGenericAudioSubsystem::RegisterMusic( UMusic* Music )
+ void UGenericAudioSubsystem::UnregisterMusic( UMusic* Music )
+ {
+ 	guard(UGenericAudioSubsystem::UnregisterMusic);
+-	if( Music && Music->Handle )
++	// CurrentMusic is not seen by the garbage collector, so it has to be forgotten when its object is
++	// destroyed, also when the song failed to load (no Handle). Otherwise it dangles into the next level.
++	if( Music && (Music->Handle || CurrentMusic==Music) )
+ 	{
+ 		debugf( NAME_DevMusic, TEXT("Unregister music: %s"), Music->GetFullName() );
+ 		if( CurrentMusic==Music )
+ 		{
+-			StopMusic();
+-			UnloadMusic();
++			if( Music->Handle )
++			{
++				StopMusic();
++				UnloadMusic();
++			}
+ 			CurrentMusic = NULL;
+ 			CurrentSection = 255;
+ 		}
+@@ -415,7 +420,9 @@ UBOOL UGenericAudioSubsystem::PlaySound
  
  	// If no sound, or its priority is overruled, stop it.
  	if( Index==-1 )
